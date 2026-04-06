@@ -1,17 +1,15 @@
 """
-test_server.py — ORION DevTools: Local testing interface.
+test_server.py
 
-Imports the agent graph from ../Orion/ and exposes a WebSocket bridge endpoint
-(/ws/robot) for external bridge processes to connect to.
-No auth, no Supabase, no Cloud Run — just the graph + MemorySaver.
+Local dev server for ORION. Spins up the agent graph with an in-memory
+checkpointer and a WS endpoint so the bridge can connect without needing
+Cloud Run or Supabase.
 
-Run:
-    cd C:\\Products\\FINAL_PRODUCTS\\orion-devtools
-    ..\\Orion\\.venv\\Scripts\\Activate.ps1
+Usage:
+    cd C:\Products\FINAL_PRODUCTS\orion-devtools
+    ..\Orion\.venv\Scripts\Activate.ps1
     pip install -r requirements.txt
     python test_server.py
-
-Opens at http://localhost:8000
 """
 
 import os
@@ -24,17 +22,13 @@ import uuid
 from datetime import datetime
 from typing import AsyncGenerator, Any, Dict, List, Optional, Union
 
-# ---------------------------------------------------------------------------
-# Path setup: add ../Orion so we can import the agent graph
-# ---------------------------------------------------------------------------
 ORION_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Orion'))
 sys.path.insert(0, ORION_ROOT)
 
-# Load .env from the Orion project (has ANTHROPIC_API_KEY, etc.)
 from dotenv import load_dotenv
 load_dotenv(os.path.join(ORION_ROOT, '.env'))
 
-# Fix Windows console encoding (cp1252 can't handle Unicode from LLM output)
+# windows terminal chokes on unicode from LLM output
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
@@ -50,9 +44,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("orion_devtools")
 
-# ---------------------------------------------------------------------------
-# Graph import (from ../Orion/src/agent/)
-# ---------------------------------------------------------------------------
+# --------GRAPH SETUP----------------------------------------------
 
 _graph = None
 _loaded_nodes: List[str] = []
@@ -67,9 +59,9 @@ def _build_graph():
         checkpointer = MemorySaver()
         _graph = create_graph_with_checkpointer(checkpointer=checkpointer, enable_verification=False)
         _loaded_nodes = sorted(ALL_NODES)
-        logger.info(f"Graph compiled with MemorySaver — nodes: {_loaded_nodes}")
+        logger.info(f"graph ready — nodes: {_loaded_nodes}")
     except Exception as e:
-        logger.error(f"FATAL: could not build graph: {e}", exc_info=True)
+        logger.error(f"couldn't build graph: {e}", exc_info=True)
         sys.exit(1)
 
 
@@ -79,9 +71,7 @@ def get_graph():
     return _graph
 
 
-# ---------------------------------------------------------------------------
-# Pydantic models (mirrors api_server.py, no auth)
-# ---------------------------------------------------------------------------
+# --------MODELS----------------------------------------------
 
 class Attachment(BaseModel):
     name: str
@@ -111,11 +101,9 @@ class ConfirmRequest(BaseModel):
     cancelled: bool = False
 
 
-# ---------------------------------------------------------------------------
-# Helpers (adapted from Orion/test_server.py)
-# ---------------------------------------------------------------------------
+# --------HELPERS----------------------------------------------
 
-MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024
 
 
 def _validate_attachments(attachments: Optional[List[Attachment]]):
@@ -153,7 +141,7 @@ def build_human_message(text: str, attachments: Optional[List[Attachment]] = Non
                     "text": f"[Attached PDF: {att.name}]\n\n{pdf_text[:50000]}",
                 })
             except Exception as e:
-                logger.warning(f"PDF extraction failed for {att.name}: {e}")
+                logger.warning(f"couldn't extract PDF {att.name}: {e}")
                 content_blocks.append({
                     "type": "text",
                     "text": f"[Attached PDF: {att.name} — could not extract text]",
@@ -183,15 +171,19 @@ def sse_event(event_type: str, data: Any) -> str:
 from src.agent.graph import ALL_NODES as _ALL_NODES_SET
 _ALL_NODES = sorted(_ALL_NODES_SET)
 
+# nodes to check for final response, in priority order
+_RESPONSE_NODES = ("chat", "tutor", "research", "troubleshooting",
+                    "robot_operator", "analysis", "summarizer")
+
 
 def extract_response(event: dict) -> Optional[str]:
+    # synthesize always wins if present
     if "synthesize" in event:
         msg = _extract_ai(event["synthesize"])
         if msg:
             return msg
 
-    for node_name in ("chat", "tutor", "research", "troubleshooting",
-                      "robot_operator", "analysis", "summarizer"):
+    for node_name in _RESPONSE_NODES:
         if node_name in event:
             msg = _extract_ai(event[node_name])
             if msg and len(msg) > 50:
@@ -215,6 +207,7 @@ def _extract_ai(node_data: dict) -> Optional[str]:
                 text = str(c).strip() if c else ""
             if text:
                 return text
+        # sometimes comes back as a raw dict instead of AIMessage
         if isinstance(msg, dict) and msg.get("role") == "assistant":
             text = (msg.get("content") or "").strip()
             if text:
@@ -249,9 +242,7 @@ def extract_chart_data(event: dict) -> Optional[dict]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
+# --------APP---------------------------------------------------------
 
 app = FastAPI(title="ORION DevTools", version="0.1.0")
 
@@ -263,9 +254,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# WebSocket bridge infrastructure
-# ---------------------------------------------------------------------------
+# ----------WEBSOCKET BRIDGE-----------------------------------------------------
 
 BRIDGE_TOKEN = os.getenv("BRIDGE_TOKEN", "dev-bridge-token")
 ROBOT_CONNECTIONS: Dict[str, WebSocket] = {}
@@ -290,10 +279,11 @@ def get_main_loop() -> asyncio.AbstractEventLoop:
 
 
 async def send_robot_command(robot_id: str, command: str, params: dict = None, timeout: float = 10.0) -> dict:
-    """Send a command to a connected robot via WebSocket bridge and wait for response."""
+    """Send command to bridge, wait for response. Tries a few matching strategies
+    if the exact robot_id isn't found (device type, IP, then just grab whatever's connected)."""
     ws = ROBOT_CONNECTIONS.get(robot_id)
 
-    # Match by device_type
+    # try matching by device_type first
     if not ws and isinstance(params, dict):
         target_type = params.get("_device_type", "")
         if target_type:
@@ -303,7 +293,7 @@ async def send_robot_command(robot_id: str, command: str, params: dict = None, t
                     ws = ROBOT_CONNECTIONS[rid]
                     break
 
-    # Match by IP
+    # try matching by IP
     if not ws:
         search_ip = robot_id if "." in robot_id else ""
         if not search_ip and isinstance(params, dict):
@@ -315,10 +305,10 @@ async def send_robot_command(robot_id: str, command: str, params: dict = None, t
                     ws = ROBOT_CONNECTIONS[rid]
                     break
 
-    # Fallback to any connected device
+    # last resort: just use whatever's connected
     if not ws and ROBOT_CONNECTIONS:
         actual_id = next(iter(ROBOT_CONNECTIONS))
-        logger.info(f"Robot '{robot_id}' not found, using '{actual_id}'")
+        logger.info(f"'{robot_id}' not found, falling back to '{actual_id}'")
         robot_id = actual_id
         ws = ROBOT_CONNECTIONS[actual_id]
 
@@ -353,7 +343,7 @@ async def send_robot_command(robot_id: str, command: str, params: dict = None, t
                 ROBOT_ACTION_LOG.setdefault(_active_session, []).append(entry)
         return result if result else {"status": "error", "error": "No response received"}
     except asyncio.TimeoutError:
-        return {"status": "error", "error": f"Command '{command}' timed out after {timeout}s"}
+        return {"status": "error", "error": f"'{command}' timed out ({timeout}s)"}
     except Exception as e:
         return {"status": "error", "error": str(e)}
     finally:
@@ -361,7 +351,7 @@ async def send_robot_command(robot_id: str, command: str, params: dict = None, t
 
 
 async def notify_bridge(robot_id: str, message: dict) -> bool:
-    """One-way notification to a connected bridge."""
+    """Fire-and-forget notification to a bridge device."""
     ws = ROBOT_CONNECTIONS.get(robot_id)
     if not ws:
         return False
@@ -373,7 +363,7 @@ async def notify_bridge(robot_id: str, message: dict) -> bool:
         return False
 
 
-# Register for worker access (automation_worker_node imports from here)
+# hook into the worker so it can call send_robot_command
 try:
     from src.agent.utils.robot_commands import register as _register_robot_cmds
     _register_robot_cmds(send_robot_command, get_main_loop)
@@ -393,9 +383,7 @@ async def health():
     }
 
 
-# ---------------------------------------------------------------------------
-# POST /api/chat — SSE streaming
-# ---------------------------------------------------------------------------
+# -------POST/Api/Chat-------------------------------------------------
 
 @app.post("/api/chat")
 async def chat_stream(req: ChatRequest):
@@ -409,7 +397,7 @@ async def chat_stream(req: ChatRequest):
     _validate_attachments(req.attachments)
     if req.attachments:
         for att in req.attachments:
-            logger.info(f"[Chat] Attachment: {att.name} ({att.type}, ~{len(att.data) * 3 // 4 // 1024}KB)")
+            logger.info(f"attachment: {att.name} ({att.type}, ~{len(att.data) * 3 // 4 // 1024}KB)")
 
     human_msg = build_human_message(req.message, req.attachments)
 
@@ -472,7 +460,7 @@ async def chat_stream(req: ChatRequest):
                     yield sse_event("error", {"message": event["__error__"]})
                     break
 
-                # Interrupt (HITL)
+                # HITL interrupt
                 if isinstance(event, dict) and "__interrupt__" in event:
                     interrupted = True
                     int_data = event.get("__interrupt__", ())
@@ -484,12 +472,11 @@ async def chat_stream(req: ChatRequest):
                         interrupt_payload = int_data
                     continue
 
-                # Node events -> node_update
                 node_events = extract_events_from_node(event)
                 for evt in node_events:
                     yield sse_event("node_update", evt)
 
-                # Which node just ran (for thinking indicator)
+                # figure out which node just ran so we can update the thinking indicator
                 for node_name in _ALL_NODES:
                     if node_name in event:
                         yield sse_event("thinking", {"node": node_name, "message": f"Running {node_name}\u2026"})
@@ -509,7 +496,6 @@ async def chat_stream(req: ChatRequest):
 
             await thread
 
-            # HITL questions
             if interrupted and interrupt_payload:
                 yield sse_event("questions", {
                     **(interrupt_payload if isinstance(interrupt_payload, dict) else {"prompt": str(interrupt_payload)}),
@@ -525,7 +511,7 @@ async def chat_stream(req: ChatRequest):
             if chart_payload:
                 yield sse_event("chart", chart_payload)
 
-            # Token usage (best-effort)
+            # token usage — might not be there, that's fine
             try:
                 final_state = graph.get_state(config)
                 if final_state and hasattr(final_state, "values"):
@@ -541,7 +527,7 @@ async def chat_stream(req: ChatRequest):
 
         except Exception as exc:
             safe_err = str(exc).encode("utf-8", errors="replace").decode("utf-8")
-            logger.error(f"Stream error: {safe_err}", exc_info=True)
+            logger.error(f"stream error: {safe_err}", exc_info=True)
             yield sse_event("error", {"message": safe_err})
             yield sse_event("done", {"session_id": session_id})
 
@@ -552,9 +538,7 @@ async def chat_stream(req: ChatRequest):
     )
 
 
-# ---------------------------------------------------------------------------
-# POST /api/confirm — HITL resume
-# ---------------------------------------------------------------------------
+# -------POST/Api/Confirm-------------------------------------------------
 
 @app.post("/api/confirm")
 async def confirm_interrupt(req: ConfirmRequest):
@@ -634,13 +618,10 @@ async def confirm_interrupt(req: ConfirmRequest):
     )
 
 
-# ---------------------------------------------------------------------------
-# WebSocket robot bridge endpoint
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------
 
 @app.websocket("/ws/robot")
 async def ws_robot(ws: WebSocket):
-    """WebSocket endpoint for robot bridge clients."""
     await ws.accept()
 
     try:
@@ -668,14 +649,13 @@ async def ws_robot(ws: WebSocket):
     }
     ROBOT_METADATA[robot_id] = meta
 
-    # Mirror to shared_state for worker access
     try:
         from src.agent.shared_state import register_robot
         register_robot(robot_id, ws, meta)
     except ImportError:
         pass
 
-    logger.info(f"Bridge connected: {robot_id} (type={meta['type']})")
+    logger.info(f"bridge connected: {robot_id} ({meta['type']})")
     await ws.send_json({"type": "registered", "robot_id": robot_id})
 
     try:
@@ -684,14 +664,13 @@ async def ws_robot(ws: WebSocket):
 
             if robot_id in ROBOT_METADATA:
                 ROBOT_METADATA[robot_id]["last_heartbeat"] = datetime.utcnow().isoformat() + "Z"
-
             cmd_id = data.get("id")
             if cmd_id and cmd_id in PENDING_COMMANDS:
                 PENDING_COMMANDS[cmd_id]["result"] = data
                 PENDING_COMMANDS[cmd_id]["event"].set()
 
             if data.get("type") == "status_update":
-                logger.info(f"Robot {robot_id} status: {data}")
+                logger.info(f"{robot_id} status: {data}")
 
             if data.get("type") == "telemetry":
                 TELEMETRY_LATEST[robot_id] = data
@@ -704,9 +683,9 @@ async def ws_robot(ws: WebSocket):
                 continue
 
     except WebSocketDisconnect:
-        logger.info(f"Bridge disconnected: {robot_id}")
+        logger.info(f"bridge disconnected: {robot_id}")
     except Exception as e:
-        logger.warning(f"Bridge error ({robot_id}): {e}")
+        logger.warning(f"bridge error ({robot_id}): {e}")
     finally:
         ROBOT_CONNECTIONS.pop(robot_id, None)
         ROBOT_METADATA.pop(robot_id, None)
@@ -716,6 +695,8 @@ async def ws_robot(ws: WebSocket):
         except ImportError:
             pass
 
+
+# ----REST Endpoitns--------------------------------------------------
 
 @app.get("/api/robots")
 async def list_robots():
@@ -757,9 +738,7 @@ async def telemetry_clear():
     return {"cleared": True}
 
 
-# ---------------------------------------------------------------------------
-# Inline HTML UI
-# ---------------------------------------------------------------------------
+# ---HTML Part --------------------------------
 
 _HTML_UI = r"""<!DOCTYPE html>
 <html lang="en">
@@ -770,170 +749,295 @@ _HTML_UI = r"""<!DOCTYPE html>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
-  font-family: -apple-system, system-ui, sans-serif;
-  background: #fff; color: #111;
+  font-family: -apple-system, system-ui, 'Segoe UI', sans-serif;
+  background: #fafafa; color: #111;
   height: 100vh; display: flex; flex-direction: column; overflow: hidden;
 }
 
+/* ── top bar ─────────────────────────────────────────── */
 .top {
-  height: 36px; border-bottom: 1px solid #e5e5e5;
-  display: flex; align-items: center; padding: 0 12px; gap: 10px; font-size: 13px;
-  flex-shrink: 0;
+  border-bottom: 1px solid #e0e0e0;
+  display: flex; align-items: center; padding: 6px 14px; gap: 8px; font-size: 13px;
+  flex-shrink: 0; background: #fff; flex-wrap: wrap;
+  min-height: 40px;
 }
-.top b { font-weight: 600; }
+.top b { font-weight: 600; letter-spacing: -0.01em; }
 .top select, .top input {
-  font-size: 12px; border: 1px solid #ddd; border-radius: 4px;
-  padding: 2px 6px; background: #fff; color: #111; outline: none;
+  font-size: 11px; border: 1px solid #ddd; border-radius: 5px;
+  padding: 3px 8px; background: #fff; color: #111; outline: none;
+  transition: border-color 0.15s;
 }
+.top select:focus, .top input:focus { border-color: #999; }
 .top .spacer { flex: 1; }
 .top button {
-  font-size: 12px; border: 1px solid #ddd; border-radius: 4px;
-  padding: 2px 10px; background: #fff; cursor: pointer;
+  font-size: 11px; border: 1px solid #ddd; border-radius: 5px;
+  padding: 3px 12px; background: #fff; cursor: pointer;
+  transition: all 0.15s;
 }
-.top button:hover { background: #f5f5f5; }
-.status { font-size: 11px; color: #888; }
+.top button:hover { background: #f0f0f0; border-color: #bbb; }
+.top button.active { background: #111; color: #fff; border-color: #111; }
+.top button.active:hover { background: #333; }
+.status { font-size: 10px; color: #aaa; font-weight: 500; }
 .status.on { color: #16a34a; }
 
 .layout { flex: 1; display: flex; overflow: hidden; }
 
-/* left sidebar */
+/* ── left sidebar ────────────────────────────────────── */
 .left-sb {
-  width: 260px; flex-shrink: 0; border-right: 1px solid #e5e5e5;
+  width: 250px; flex-shrink: 0; border-right: 1px solid #e0e0e0;
   display: flex; flex-direction: column; overflow: hidden; font-size: 12px;
+  background: #fff;
 }
 .left-sb.hidden { display: none; }
 .left-sb-header {
-  padding: 8px 12px; border-bottom: 1px solid #e5e5e5;
+  padding: 10px 12px; border-bottom: 1px solid #e0e0e0;
   display: flex; align-items: center; justify-content: space-between;
 }
-.left-sb-header span { font-size: 11px; font-weight: 600; color: #999; }
+.left-sb-header span { font-size: 10px; font-weight: 600; color: #999; text-transform: uppercase; letter-spacing: 0.05em; }
 .left-sb-header button {
   font-size: 10px; border: 1px solid #e5e5e5; border-radius: 4px;
-  padding: 2px 8px; background: #fff; cursor: pointer; color: #888;
+  padding: 2px 8px; background: #fff; cursor: pointer; color: #999;
+  transition: all 0.15s;
 }
 .left-sb-header button:hover { background: #f5f5f5; color: #111; }
 .left-sb-stats {
-  padding: 6px 12px; border-bottom: 1px solid #e5e5e5;
-  display: flex; gap: 12px; font-size: 11px; color: #888;
+  padding: 8px 12px; border-bottom: 1px solid #e0e0e0;
+  display: flex; gap: 14px; font-size: 10px; color: #999;
 }
 .left-sb-stats b { color: #111; font-weight: 600; }
 .move-list { flex: 1; overflow-y: auto; }
 .move-list::-webkit-scrollbar { width: 3px; }
-.move-list::-webkit-scrollbar-thumb { background: #ddd; }
+.move-list::-webkit-scrollbar-thumb { background: #ddd; border-radius: 2px; }
 .move-item {
-  padding: 5px 12px; border-bottom: 1px solid #f5f5f5;
+  padding: 6px 12px; border-bottom: 1px solid #f0f0f0;
   display: flex; gap: 8px; align-items: flex-start;
+  transition: background 0.1s;
 }
-.move-item:hover { background: #fafafa; }
-.move-num { font-family: monospace; font-size: 10px; color: #bbb; min-width: 18px; padding-top: 1px; }
+.move-item:hover { background: #f8f8f8; }
+.move-num { font-family: monospace; font-size: 10px; color: #ccc; min-width: 18px; padding-top: 1px; }
 .move-info { flex: 1; min-width: 0; }
 .move-joint { font-weight: 600; font-size: 11px; }
-.move-detail { font-size: 10px; color: #888; margin-top: 1px; }
-.move-ts { font-family: monospace; font-size: 9px; color: #bbb; white-space: nowrap; padding-top: 1px; }
-.empty-state { padding: 20px 12px; text-align: center; color: #bbb; font-size: 11px; }
+.move-detail { font-size: 10px; color: #999; margin-top: 2px; }
+.move-ts { font-family: monospace; font-size: 9px; color: #ccc; white-space: nowrap; padding-top: 1px; }
+.empty-state { padding: 32px 12px; text-align: center; color: #ccc; font-size: 11px; }
 .left-sb-export {
-  padding: 6px 12px; border-top: 1px solid #e5e5e5; display: flex; gap: 4px; flex-shrink: 0;
+  padding: 8px 12px; border-top: 1px solid #e0e0e0; display: flex; gap: 4px; flex-shrink: 0;
 }
 .left-sb-export button {
   flex: 1; padding: 4px; border: 1px solid #e5e5e5; border-radius: 4px;
-  background: #fff; font-size: 10px; cursor: pointer; color: #888;
+  background: #fff; font-size: 10px; cursor: pointer; color: #999;
+  transition: all 0.15s;
 }
 .left-sb-export button:hover { background: #f5f5f5; color: #111; }
 
-/* chat */
-.chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-.messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-.msg-u { align-self: flex-end; background: #111; color: #fff; padding: 8px 14px; border-radius: 14px 14px 4px 14px; font-size: 13px; max-width: 75%; white-space: pre-wrap; word-break: break-word; }
-.msg-a { font-size: 13px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; max-width: 85%; }
-.msg-a-label { font-size: 10px; font-weight: 600; color: #999; letter-spacing: 0.1em; margin-bottom: 2px; }
-.msg-err { font-size: 12px; color: #dc2626; font-family: monospace; background: #fef2f2; padding: 6px 10px; border-radius: 6px; }
-.msg-narr { font-size: 11px; color: #888; font-style: italic; border-left: 2px solid #e5e5e5; padding-left: 8px; }
-.thinking { display: none; align-items: center; gap: 8px; padding: 4px 16px 8px; font-size: 12px; color: #888; }
+/* ── chat area ───────────────────────────────────────── */
+.chat { flex: 1; display: flex; flex-direction: column; min-width: 0; background: #fafafa; }
+.messages {
+  flex: 1; overflow-y: auto; padding: 24px 0; display: flex; flex-direction: column; gap: 16px;
+  align-items: center;
+}
+.messages::-webkit-scrollbar { width: 4px; }
+.messages::-webkit-scrollbar-thumb { background: #ddd; border-radius: 2px; }
+.msg-wrap {
+  width: 100%; max-width: 680px; padding: 0 24px;
+}
+.msg-u {
+  margin-left: auto; background: #111; color: #fff;
+  padding: 10px 16px; border-radius: 16px 16px 4px 16px; font-size: 13px;
+  max-width: 80%; width: fit-content;
+  white-space: pre-wrap; word-break: break-word;
+  line-height: 1.5;
+}
+.msg-a-wrap { max-width: 100%; }
+.msg-a {
+  font-size: 13px; line-height: 1.7; white-space: pre-wrap; word-break: break-word;
+  color: #222;
+}
+.msg-a-label { font-size: 9px; font-weight: 600; color: #bbb; letter-spacing: 0.08em; margin-bottom: 4px; text-transform: uppercase; }
+.msg-err {
+  font-size: 12px; color: #dc2626; font-family: monospace;
+  background: #fef2f2; padding: 8px 12px; border-radius: 8px;
+  border: 1px solid #fecaca;
+}
+.msg-narr {
+  font-size: 11px; color: #999; font-style: italic;
+  border-left: 2px solid #e0e0e0; padding-left: 10px;
+}
+
+/* thinking */
+.thinking { display: none; align-items: center; gap: 8px; padding: 4px 24px 8px; font-size: 12px; color: #999; justify-content: center; }
 .thinking.on { display: flex; }
-.dot-pulse { width: 6px; height: 6px; background: #999; border-radius: 50%; animation: pulse 1s infinite; }
-@keyframes pulse { 0%,100% { opacity:.3; } 50% { opacity:1; } }
-.sugs { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 16px 6px; }
-.sug { padding: 4px 12px; border: 1px solid #e5e5e5; border-radius: 14px; font-size: 11px; color: #666; cursor: pointer; background: #fff; }
-.sug:hover { border-color: #999; color: #111; }
-.input-area { padding: 8px 16px 12px; }
-.input-box { display: flex; border: 1px solid #ddd; border-radius: 10px; background: #fff; }
-.input-box:focus-within { border-color: #999; }
+.dot-pulse { width: 5px; height: 5px; background: #bbb; border-radius: 50%; animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100% { opacity:.2; } 50% { opacity:1; } }
+
+/* suggestions */
+.sugs { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 0 8px; justify-content: center; }
+.sug {
+  padding: 5px 14px; border: 1px solid #e0e0e0; border-radius: 16px;
+  font-size: 11px; color: #777; cursor: pointer; background: #fff;
+  transition: all 0.15s;
+}
+.sug:hover { border-color: #999; color: #111; background: #f8f8f8; }
+
+/* input area */
+.input-area { padding: 8px 24px 16px; display: flex; justify-content: center; }
+.input-box {
+  display: flex; border: 1px solid #ddd; border-radius: 12px;
+  background: #fff; width: 100%; max-width: 680px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.input-box:focus-within { border-color: #bbb; box-shadow: 0 1px 6px rgba(0,0,0,0.06); }
 .input-box textarea {
-  flex: 1; border: none; padding: 10px 12px; font-size: 13px; font-family: inherit;
+  flex: 1; border: none; padding: 10px 14px; font-size: 13px; font-family: inherit;
   background: transparent; color: #111; resize: none; outline: none;
   min-height: 40px; max-height: 120px; line-height: 1.5;
 }
-.input-box textarea::placeholder { color: #bbb; }
-.input-box button { padding: 0 12px; border: none; background: transparent; cursor: pointer; font-size: 16px; color: #bbb; }
+.input-box textarea::placeholder { color: #ccc; }
+.input-box button {
+  padding: 0 12px; border: none; background: transparent; cursor: pointer;
+  font-size: 15px; color: #ccc; transition: color 0.15s;
+}
+.input-box button:hover { color: #888; }
 .input-box button.active { color: #111; }
 #fileInput { display: none; }
-.attach-row { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 16px 4px; }
-.att { font-size: 10px; color: #666; background: #f5f5f5; padding: 2px 8px; border-radius: 8px; }
+.attach-row { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 24px 4px; justify-content: center; }
+.att { font-size: 10px; color: #777; background: #f0f0f0; padding: 3px 10px; border-radius: 10px; }
 .att span { color: #dc2626; cursor: pointer; margin-left: 4px; font-weight: 700; }
-.hitl { display: none; padding: 12px 16px; border-top: 2px solid #f59e0b; }
-.hitl.on { display: block; }
-.hitl h3 { font-size: 13px; margin-bottom: 8px; }
-.hitl label { display: block; font-size: 11px; color: #666; margin: 6px 0 2px; }
-.hitl input, .hitl select { width: 100%; padding: 6px 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 12px; }
-.hitl .btns { margin-top: 10px; display: flex; gap: 6px; }
-.hitl .btns button { padding: 5px 14px; border: 1px solid #ddd; border-radius: 4px; font-size: 12px; cursor: pointer; background: #fff; }
-.hitl .btns button.p { background: #111; color: #fff; border-color: #111; }
 
-/* right sidebar */
+/* hitl */
+.hitl { display: none; padding: 14px 24px; border-top: 2px solid #f59e0b; background: #fffbeb; }
+.hitl.on { display: block; }
+.hitl h3 { font-size: 13px; margin-bottom: 10px; font-weight: 600; }
+.hitl label { display: block; font-size: 11px; color: #666; margin: 8px 0 3px; }
+.hitl input, .hitl select {
+  width: 100%; padding: 7px 10px; border: 1px solid #ddd; border-radius: 6px;
+  font-size: 12px; outline: none; transition: border-color 0.15s;
+}
+.hitl input:focus, .hitl select:focus { border-color: #f59e0b; }
+.hitl .btns { margin-top: 12px; display: flex; gap: 6px; }
+.hitl .btns button {
+  padding: 6px 16px; border: 1px solid #ddd; border-radius: 6px;
+  font-size: 12px; cursor: pointer; background: #fff; transition: all 0.15s;
+}
+.hitl .btns button.p { background: #111; color: #fff; border-color: #111; }
+.hitl .btns button.p:hover { background: #333; }
+
+/* ── right sidebar ───────────────────────────────────── */
 .sidebar {
-  width: 340px; flex-shrink: 0; border-left: 1px solid #e5e5e5;
+  width: 320px; flex-shrink: 0; border-left: 1px solid #e0e0e0;
   display: flex; flex-direction: column; overflow: hidden; font-size: 12px;
+  background: #fff;
 }
 .sidebar.hidden { display: none; }
-.sb-section { border-bottom: 1px solid #e5e5e5; padding: 10px 12px; flex-shrink: 0; }
-.sb-title { font-size: 11px; font-weight: 600; color: #999; margin-bottom: 6px; }
-.sb-row { display: flex; justify-content: space-between; padding: 2px 0; }
-.sb-row .k { color: #888; }
-.sb-row .v { font-weight: 500; font-family: monospace; font-size: 11px; }
-.sb-tabs { display: flex; border-bottom: 1px solid #e5e5e5; flex-shrink: 0; }
+.sb-section { border-bottom: 1px solid #e0e0e0; padding: 12px 14px; flex-shrink: 0; }
+.sb-title { font-size: 10px; font-weight: 600; color: #999; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+.sb-row { display: flex; justify-content: space-between; padding: 3px 0; }
+.sb-row .k { color: #999; font-size: 11px; }
+.sb-row .v { font-weight: 500; font-family: monospace; font-size: 11px; color: #333; }
+.sb-tabs { display: flex; border-bottom: 1px solid #e0e0e0; flex-shrink: 0; }
 .sb-tab {
-  flex: 1; padding: 6px 0; text-align: center; font-size: 11px; font-weight: 500;
-  color: #999; cursor: pointer; border-bottom: 2px solid transparent;
+  flex: 1; padding: 8px 0; text-align: center; font-size: 11px; font-weight: 500;
+  color: #bbb; cursor: pointer; border-bottom: 2px solid transparent;
+  transition: all 0.15s;
 }
-.sb-tab:hover { color: #666; }
+.sb-tab:hover { color: #888; }
 .sb-tab.on { color: #111; border-bottom-color: #111; }
 .sb-panel { display: none; flex: 1; flex-direction: column; overflow: hidden; }
 .sb-panel.on { display: flex; }
-.sb-trace { flex: 1; overflow-y: auto; padding: 10px 12px; }
+.sb-trace { flex: 1; overflow-y: auto; padding: 12px 14px; }
 .sb-trace::-webkit-scrollbar { width: 3px; }
-.sb-trace::-webkit-scrollbar-thumb { background: #ddd; }
-.trace-run { margin-bottom: 12px; }
-.trace-run-header { font-weight: 600; font-size: 12px; margin-bottom: 4px; display: flex; justify-content: space-between; }
-.trace-run-header .ms { font-weight: 400; color: #888; font-family: monospace; }
-.trace-node { display: flex; gap: 8px; padding: 3px 0; border-bottom: 1px solid #f5f5f5; }
+.sb-trace::-webkit-scrollbar-thumb { background: #ddd; border-radius: 2px; }
+
+/* trace nodes — no vertical bar, only horizontal latency bar */
+.trace-run { margin-bottom: 16px; }
+.trace-run-header {
+  font-weight: 600; font-size: 12px; margin-bottom: 8px;
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding-bottom: 6px; border-bottom: 1px solid #f0f0f0;
+}
+.trace-run-header .ms { font-weight: 400; color: #999; font-family: monospace; font-size: 11px; }
+.trace-node {
+  padding: 6px 0;
+  border-bottom: 1px solid #f5f5f5;
+}
 .trace-node:last-child { border-bottom: none; }
-.tn-bar { width: 3px; border-radius: 1px; flex-shrink: 0; }
-.tn-body { flex: 1; min-width: 0; }
 .tn-top { display: flex; justify-content: space-between; align-items: center; }
-.tn-name { font-weight: 500; font-size: 11px; }
-.tn-ms { font-family: monospace; font-size: 10px; color: #888; }
-.tn-detail { font-size: 10px; color: #999; line-height: 1.4; margin-top: 1px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; cursor: default; }
+.tn-name { font-weight: 500; font-size: 11px; color: #333; }
+.tn-ms { font-family: monospace; font-size: 10px; color: #999; }
+.tn-detail {
+  font-size: 10px; color: #aaa; line-height: 1.4; margin-top: 2px;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; cursor: default;
+}
 .tn-detail:hover { white-space: normal; }
-.tn-latbar { height: 3px; background: #f0f0f0; border-radius: 1px; margin-top: 3px; overflow: hidden; }
-.tn-latfill { height: 100%; border-radius: 1px; }
-.sb-raw { flex: 1; overflow-y: auto; padding: 6px 12px; font-family: monospace; font-size: 10px; }
+.tn-latbar { height: 3px; background: #f0f0f0; border-radius: 2px; margin-top: 4px; overflow: hidden; }
+.tn-latfill { height: 100%; border-radius: 2px; min-width: 6px; }
+
+/* raw events */
+.sb-raw { flex: 1; overflow-y: auto; padding: 8px 14px; font-family: monospace; font-size: 10px; }
 .sb-raw::-webkit-scrollbar { width: 3px; }
-.sb-raw::-webkit-scrollbar-thumb { background: #ddd; }
-.raw-line { padding: 2px 0; border-bottom: 1px solid #fafafa; color: #888; display: flex; gap: 6px; }
-.raw-line .rt { color: #bbb; white-space: nowrap; }
-.raw-line .re { font-weight: 600; min-width: 60px; }
+.sb-raw::-webkit-scrollbar-thumb { background: #ddd; border-radius: 2px; }
+.raw-line { padding: 3px 0; border-bottom: 1px solid #f8f8f8; color: #999; display: flex; gap: 8px; }
+.raw-line .rt { color: #ccc; white-space: nowrap; }
+.raw-line .re { font-weight: 600; min-width: 65px; }
 .raw-line .re.thinking { color: #f59e0b; }
 .raw-line .re.response { color: #16a34a; }
 .raw-line .re.error { color: #dc2626; }
 .raw-line .re.node_update { color: #2563eb; }
 .raw-line .rd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .raw-line:hover .rd { white-space: normal; word-break: break-all; }
-.sb-export { padding: 8px 12px; border-top: 1px solid #e5e5e5; display: flex; gap: 4px; flex-shrink: 0; }
+.sb-export { padding: 8px 14px; border-top: 1px solid #e0e0e0; display: flex; gap: 4px; flex-shrink: 0; }
 .sb-export button {
-  flex: 1; padding: 4px; border: 1px solid #e5e5e5; border-radius: 4px;
-  background: #fff; font-size: 10px; cursor: pointer; color: #888;
+  flex: 1; padding: 5px; border: 1px solid #e5e5e5; border-radius: 5px;
+  background: #fff; font-size: 10px; cursor: pointer; color: #999;
+  transition: all 0.15s;
 }
 .sb-export button:hover { background: #f5f5f5; color: #111; }
+
+/* ── responsive ──────────────────────────────────────── */
+
+/* medium screens: auto-hide sidebars, narrower panels */
+@media (max-width: 1100px) {
+  .left-sb { width: 220px; }
+  .sidebar { width: 280px; }
+}
+
+@media (max-width: 900px) {
+  .left-sb { width: 200px; }
+  .sidebar { width: 260px; }
+  .msg-wrap { padding: 0 16px; }
+  .input-area { padding: 8px 16px 12px; }
+  .input-box { max-width: 100%; }
+}
+
+/* small screens: sidebars overlay the chat */
+@media (max-width: 700px) {
+  .top { gap: 6px; padding: 6px 10px; }
+  .top b { font-size: 12px; }
+  .top select, .top input { font-size: 10px; padding: 2px 6px; }
+  .top button { font-size: 10px; padding: 2px 8px; }
+  .top .spacer { flex-basis: 100%; height: 0; }
+
+  .layout { position: relative; }
+  .left-sb {
+    position: absolute; left: 0; top: 0; bottom: 0; z-index: 10;
+    width: 260px; box-shadow: 2px 0 8px rgba(0,0,0,0.08);
+  }
+  .sidebar {
+    position: absolute; right: 0; top: 0; bottom: 0; z-index: 10;
+    width: 280px; box-shadow: -2px 0 8px rgba(0,0,0,0.08);
+  }
+  .messages { padding: 16px 0; gap: 12px; }
+  .msg-wrap { padding: 0 12px; max-width: 100%; }
+  .input-area { padding: 6px 12px 10px; }
+  .input-box { max-width: 100%; }
+}
+
+@media (max-width: 480px) {
+  .top select, .top input { max-width: 80px; }
+  .left-sb { width: 100%; }
+  .sidebar { width: 100%; }
+}
 </style>
 </head>
 <body>
@@ -944,10 +1048,10 @@ body {
   <div class="spacer"></div>
   <select id="cfgModel"><option value="">default model</option><option value="claude-sonnet-4-5-20250929">sonnet-4.5</option><option value="claude-sonnet-4-20250514">sonnet-4</option><option value="claude-haiku-4-5-20251001">haiku-4.5</option><option value="gpt-4o">gpt-4o</option></select>
   <select id="cfgMode"><option value="automation">automation</option><option value="chat">chat</option><option value="practice">practice</option><option value="troubleshoot">troubleshoot</option></select>
-  <input id="cfgEquipment" placeholder="equipment_id" style="width:90px">
+  <input id="cfgEquipment" placeholder="equipment_id" style="width:90px;min-width:60px;flex-shrink:1">
   <button onclick="clearAll()">clear</button>
-  <button onclick="toggleLeft()">movements</button>
-  <button onclick="toggleSidebar()">trace</button>
+  <button id="btnLeft" onclick="toggleLeft()">&#9654; movements</button>
+  <button id="btnRight" onclick="toggleSidebar()">trace &#9664;</button>
 </div>
 
 <div class="layout">
@@ -960,7 +1064,7 @@ body {
         <button onclick="clearMoves()">clear</button>
       </div>
     </div>
-    <div id="telemLive" style="padding:4px 12px;font-family:monospace;font-size:10px;border-bottom:1px solid #e5e5e5;color:#888;">waiting for telemetry...</div>
+    <div id="telemLive" style="padding:6px 12px;font-family:monospace;font-size:10px;border-bottom:1px solid #e0e0e0;color:#999;">waiting for telemetry...</div>
     <div class="left-sb-stats">
       <span>actions: <b id="moveCount">0</b></span>
       <span>samples: <b id="telemCount">0</b></span>
@@ -990,7 +1094,7 @@ body {
       <div class="input-box">
         <textarea id="input" rows="1" placeholder="message..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}" oninput="autoGrow(this)"></textarea>
         <button onclick="document.getElementById('fileInput').click()">+</button>
-        <button id="sendBtn" onclick="send()">^</button>
+        <button id="sendBtn" onclick="send()">&#x2191;</button>
         <input type="file" id="fileInput" multiple onchange="addFiles(this.files)">
       </div>
     </div>
@@ -1002,7 +1106,6 @@ body {
       <div class="sb-row"><span class="k">id</span><span class="v" id="sId">-</span></div>
       <div class="sb-row"><span class="k">messages</span><span class="v" id="sMsgs">0</span></div>
       <div class="sb-row"><span class="k">errors</span><span class="v" id="sErrs">0</span></div>
-      <div class="sb-row"><span class="k">tokens (last)</span><span class="v" id="sTokens">-</span></div>
       <div class="sb-row"><span class="k">avg latency</span><span class="v" id="sAvg">-</span></div>
       <div class="sb-row"><span class="k">bridge</span><span class="v" id="sBridge">-</span></div>
     </div>
@@ -1049,12 +1152,12 @@ function renderMoves() {
   for (var i = movements.length - 1; i >= 0; i--) {
     var m = movements[i];
     var detail = '';
-    if(m.command==='move_joint'&&m.from!=null)detail=m.from+' -> '+m.to+' deg';
-    else if(m.command==='move_joint')detail=m.to+' deg';
+    if(m.command==='move_joint'&&m.from!=null)detail=m.from+' \u2192 '+m.to+'\u00b0';
+    else if(m.command==='move_joint')detail=m.to+'\u00b0';
     else if(m.final_angles)detail=m.final_angles.map(function(a,i){return'J'+(i+1)+':'+Math.round(a*10)/10;}).join(' ');
     else if(m.name)detail=m.name;
     else detail=m.command||'';
-    var color = m.status === 'ok' ? '#16a34a' : m.status === 'error' ? '#dc2626' : m.status === 'noop' ? '#888' : '#2563eb';
+    var color = m.status === 'ok' ? '#16a34a' : m.status === 'error' ? '#dc2626' : m.status === 'noop' ? '#999' : '#2563eb';
     html += '<div class="move-item"><div class="move-num">' + m.n + '</div><div class="move-info"><div class="move-joint" style="color:' + color + '">' + esc(m.joint + (m.name ? ' (' + m.name + ')' : '')) + '</div><div class="move-detail">' + esc(detail) + '</div></div><div class="move-ts">' + m.time + '</div></div>';
   }
   $('moveList').innerHTML = html;
@@ -1068,13 +1171,12 @@ function exportMovesCSV(){
 }
 function exportMovesJSON() { dl('movements.json', JSON.stringify(movements, null, 2), 'application/json'); }
 function copyMoves() {
-  var t = movements.map(function(m) { return m.n+'. ['+m.time+'] '+m.joint+(m.name?' ('+m.name+')':'')+' -> '+(m.to!==null?m.to+'deg':'?')+(m.status==='error'?' FAILED':''); }).join('\n');
+  var t = movements.map(function(m) { return m.n+'. ['+m.time+'] '+m.joint+(m.name?' ('+m.name+')':'')+' \u2192 '+(m.to!==null?m.to+'\u00b0':'?')+(m.status==='error'?' FAILED':''); }).join('\n');
   navigator.clipboard.writeText(t);
 }
 
-// --- sidebars ---
-function toggleLeft() { $('leftSb').classList.toggle('hidden'); }
-function toggleSidebar() { $('sidebar').classList.toggle('hidden'); }
+function toggleLeft() { $('leftSb').classList.toggle('hidden'); $('btnLeft').classList.toggle('active', !$('leftSb').classList.contains('hidden')); }
+function toggleSidebar() { $('sidebar').classList.toggle('hidden'); $('btnRight').classList.toggle('active', !$('sidebar').classList.contains('hidden')); }
 function sbTab(name, el) {
   document.querySelectorAll('.sb-tab').forEach(function(t){t.classList.remove('on');});
   document.querySelectorAll('.sb-panel').forEach(function(p){p.classList.remove('on');});
@@ -1082,41 +1184,51 @@ function sbTab(name, el) {
   $('p'+name.charAt(0).toUpperCase()+name.slice(1)).classList.add('on');
 }
 
-// --- chat ---
 function scrollDown() { var m = $('msgs'); requestAnimationFrame(function(){m.scrollTop=m.scrollHeight;}); }
 function ts() { return new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}); }
+
 function addChat(type, text) {
-  var d = document.createElement('div');
-  if (type==='user') d.innerHTML='<div class="msg-u">'+esc(text)+'</div>';
-  else if (type==='ai') d.innerHTML='<div class="msg-a-label">ORION</div><div class="msg-a">'+esc(text)+'</div>';
-  else if (type==='err') d.innerHTML='<div class="msg-err">'+esc(text)+'</div>';
-  else if (type==='narr') d.innerHTML='<div class="msg-narr">'+esc(text)+'</div>';
-  $('msgs').appendChild(d); scrollDown();
+  var wrap = document.createElement('div');
+  wrap.className = 'msg-wrap';
+  if (type==='user') wrap.innerHTML='<div class="msg-u">'+esc(text)+'</div>';
+  else if (type==='ai') wrap.innerHTML='<div class="msg-a-wrap"><div class="msg-a-label">ORION</div><div class="msg-a">'+esc(text)+'</div></div>';
+  else if (type==='err') wrap.innerHTML='<div class="msg-err">'+esc(text)+'</div>';
+  else if (type==='narr') wrap.innerHTML='<div class="msg-narr">'+esc(text)+'</div>';
+  $('msgs').appendChild(wrap); scrollDown();
 }
+
 function setThink(on,msg){$('thinkBar').classList.toggle('on',on);if(msg)$('thinkText').textContent=msg;}
 function autoGrow(el){el.style.height='auto';el.style.height=Math.min(el.scrollHeight,120)+'px';$('sendBtn').classList.toggle('active',el.value.trim().length>0);}
 function addFiles(files){for(var i=0;i<files.length;i++){(function(f){var r=new FileReader();r.onload=function(){atts.push({name:f.name,type:f.type||'application/octet-stream',data:r.result.split(',')[1]});renderAtts();};r.readAsDataURL(f);})(files[i]);}$('fileInput').value='';}
-function renderAtts(){$('attRow').innerHTML=atts.map(function(a,i){return'<span class="att">'+esc(a.name)+'<span onclick="atts.splice('+i+',1);renderAtts()">x</span></span>';}).join('');}
+function renderAtts(){$('attRow').innerHTML=atts.map(function(a,i){return'<span class="att">'+esc(a.name)+'<span onclick="atts.splice('+i+',1);renderAtts()">\u00d7</span></span>';}).join('');}
 function showSugs(list){$('sugs').innerHTML=list.map(function(s){var t=typeof s==='string'?s:s.text||JSON.stringify(s);return'<span class="sug" onclick="$(\'input\').value=this.textContent;send()">'+esc(t)+'</span>';}).join('');}
 
-// --- trace ---
 function startRun(p){cur={id:Date.now(),prompt:p,response:'',nodes:[],totalMs:0,t0:performance.now()};}
 function addNode(n,d){if(!cur)return;var now=performance.now();var prev=cur.nodes.length?cur.nodes[cur.nodes.length-1]._t:cur.t0;cur.nodes.push({name:n,detail:d||'',ms:Math.round(now-prev),_t:now,wall:ts()});}
 function endRun(r){if(!cur)return;cur.totalMs=Math.round(performance.now()-cur.t0);cur.response=r||'';runs.push(cur);renderTrace();updateStats();cur=null;}
+
 function renderTrace(){
   var c=$('traceContainer');c.innerHTML='';
-  for(var i=runs.length-1;i>=0;i--){var r=runs[i];var mx=Math.max.apply(null,r.nodes.map(function(n){return n.ms;}));if(mx<1)mx=1;
-  var h='<div class="trace-run"><div class="trace-run-header"><span>'+esc(r.prompt.substring(0,60))+'</span><span class="ms">'+(r.totalMs/1000).toFixed(1)+'s</span></div>';
-  r.nodes.forEach(function(n){var p=Math.min((n.ms/mx)*100,100);var co=n.ms<2000?'#16a34a':n.ms<8000?'#f59e0b':'#dc2626';
-  h+='<div class="trace-node"><div class="tn-bar" style="background:'+co+'"></div><div class="tn-body"><div class="tn-top"><span class="tn-name">'+esc(n.name)+'</span><span class="tn-ms">'+n.ms+'ms</span></div>';
-  if(n.detail)h+='<div class="tn-detail">'+esc(n.detail)+'</div>';
-  h+='<div class="tn-latbar"><div class="tn-latfill" style="width:'+p+'%;background:'+co+'"></div></div></div></div>';});
-  h+='</div>';c.innerHTML+=h;}
+  for(var i=runs.length-1;i>=0;i--){
+    var r=runs[i];
+    var mx=Math.max.apply(null,r.nodes.map(function(n){return n.ms;}));
+    if(mx<1)mx=1;
+    var h='<div class="trace-run"><div class="trace-run-header"><span>'+esc(r.prompt.substring(0,50))+'</span><span class="ms">'+(r.totalMs/1000).toFixed(1)+'s</span></div>';
+    r.nodes.forEach(function(n){
+      var p=Math.min((n.ms/mx)*100,100);
+      var co=n.ms<2000?'#16a34a':n.ms<8000?'#f59e0b':'#dc2626';
+      h+='<div class="trace-node"><div class="tn-top"><span class="tn-name">'+esc(n.name)+'</span><span class="tn-ms">'+n.ms+'ms</span></div>';
+      if(n.detail)h+='<div class="tn-detail">'+esc(n.detail)+'</div>';
+      h+='<div class="tn-latbar"><div class="tn-latfill" style="width:'+p+'%;background:'+co+'"></div></div></div>';
+    });
+    h+='</div>';
+    c.innerHTML+=h;
+  }
 }
-function updateStats(){$('sMsgs').textContent=msgCount;$('sErrs').textContent=errCount;if(lastTokens)$('sTokens').textContent=lastTokens;if(runs.length){var avg=Math.round(runs.reduce(function(s,r){return s+r.totalMs;},0)/runs.length);$('sAvg').textContent=(avg/1000).toFixed(1)+'s';}}
+
+function updateStats(){$('sMsgs').textContent=msgCount;$('sErrs').textContent=errCount;if(runs.length){var avg=Math.round(runs.reduce(function(s,r){return s+r.totalMs;},0)/runs.length);$('sAvg').textContent=(avg/1000).toFixed(1)+'s';}}
 function logRaw(type,data){var d=document.createElement('div');d.className='raw-line';d.innerHTML='<span class="rt">'+ts()+'</span><span class="re '+type+'">'+type+'</span><span class="rd">'+esc(JSON.stringify(data)).substring(0,300)+'</span>';$('rawContainer').appendChild(d);$('rawContainer').scrollTop=$('rawContainer').scrollHeight;}
 
-// --- send ---
 async function send(){
   if(busy)return;var text=$('input').value.trim();if(!text&&!atts.length)return;
   busy=true;if(text){addChat('user',text);msgCount++;}
@@ -1144,7 +1256,7 @@ function handleSSE(type,data,final){
     case'response':setThink(false);if(data.content){addChat('ai',data.content);final=data.content;}break;
     case'suggestions':showSugs(data.suggestions||[]);break;
     case'questions':showHITL(data);break;
-    case'tokens':lastTokens=data.total||data.used||0;$('sTokens').textContent=lastTokens+(data.model?' ('+data.model+')':'');break;
+    case'tokens':lastTokens=data.total||data.used||0;break;
     case 'robot_action':
       var rd=data.data||{};var cmd=data.command||'';
       var mv={n:movements.length+1,time:ts(),timestamp:data.timestamp||new Date().toISOString(),device:data.device_id||'',command:cmd,status:'ok'};
@@ -1161,23 +1273,20 @@ function handleSSE(type,data,final){
   return final;
 }
 
-// --- hitl ---
 function showHITL(data){setThink(false);hitlSid=data.session_id||sessionId;$('hitlTitle').textContent=data.title||'Input required';var c=$('hitlQs');c.innerHTML='';var qs=data.questions||[];if(!qs.length&&data.prompt){addChat('ai',data.prompt);return;}
 qs.forEach(function(q,i){var d=document.createElement('div');d.innerHTML='<label>'+esc(q.question||q.label||'Q'+(i+1))+'</label>';if(q.options&&q.options.length){var sel=document.createElement('select');sel.dataset.key=q.key||('q'+i);q.options.forEach(function(o){var opt=document.createElement('option');opt.value=typeof o==='string'?o:o.value;opt.textContent=typeof o==='string'?o:o.label;sel.appendChild(opt);});d.appendChild(sel);}else{var inp=document.createElement('input');inp.dataset.key=q.key||('q'+i);inp.placeholder=q.placeholder||'';d.appendChild(inp);}c.appendChild(d);});$('hitl').classList.add('on');}
 async function submitHITL(){var ans={};$('hitlQs').querySelectorAll('input,select').forEach(function(el){ans[el.dataset.key]=el.value;});$('hitl').classList.remove('on');setThink(true,'submitting...');busy=true;try{await doStream(BASE+'/api/confirm',{session_id:hitlSid,answers:ans,completed:true,cancelled:false});}catch(e){addChat('err',e.message);}setThink(false);busy=false;}
 function cancelHITL(){$('hitl').classList.remove('on');}
 
-// --- exports (trace) ---
 function exportJSON(){var d={runs:runs.map(function(r){return{prompt:r.prompt,response:r.response,totalMs:r.totalMs,nodes:r.nodes.map(function(n){return{name:n.name,ms:n.ms,detail:n.detail,wall:n.wall};})};})};dl('trace.json',JSON.stringify(d,null,2),'application/json');}
 function exportCSV(){var csv='run,prompt,node,ms,detail\n';runs.forEach(function(r,i){r.nodes.forEach(function(n){csv+=(i+1)+',"'+r.prompt.replace(/"/g,'""')+'","'+n.name+'",'+n.ms+',"'+(n.detail||'').replace(/"/g,'""')+'"\n';});});dl('trace.csv',csv,'text/csv');}
 function dl(name,content,mime){var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([content],{type:mime}));a.download=name;a.click();}
 function copyLast(){var r=runs[runs.length-1];if(!r)return;navigator.clipboard.writeText(r.nodes.map(function(n){return'['+n.wall+'] '+n.name+' ('+n.ms+'ms) '+(n.detail||'');}).join('\n'));}
 
-// --- bridge ---
 async function pollBridge(){try{var r=await fetch(BASE+'/api/robots',{signal:AbortSignal.timeout(3000)});var d=await r.json();var n=d.count||0;$('bridgeStatus').textContent=n>0?n+' device'+(n>1?'s':'')+' connected':'no bridge';$('bridgeStatus').className='status'+(n>0?' on':'');$('sBridge').textContent=n>0?d.robots.map(function(r){return r.robot_id;}).join(', '):'none';}catch(e){$('bridgeStatus').textContent='offline';$('bridgeStatus').className='status';}}
 setInterval(pollBridge,3000);pollBridge();
 
-function clearAll(){$('msgs').innerHTML='';$('rawContainer').innerHTML='';$('traceContainer').innerHTML='';$('sugs').innerHTML='';runs=[];cur=null;msgCount=0;errCount=0;lastTokens=0;sessionId='';$('sId').textContent='-';$('sTokens').textContent='-';updateStats();clearMoves();}
+function clearAll(){$('msgs').innerHTML='';$('rawContainer').innerHTML='';$('traceContainer').innerHTML='';$('sugs').innerHTML='';runs=[];cur=null;msgCount=0;errCount=0;lastTokens=0;sessionId='';$('sId').textContent='-';updateStats();clearMoves();}
 var telemData=[];var telemRecording=false;
 function pollTelemetry(){
   fetch(BASE+'/api/telemetry/latest',{signal:AbortSignal.timeout(2000)}).then(function(r){return r.json();}).then(function(d){
@@ -1215,6 +1324,14 @@ function exportTelemCSV(){
 }
 
 $('input').focus();
+// start with sidebars matching screen size
+if (window.innerWidth <= 700) {
+  $('leftSb').classList.add('hidden');
+  $('sidebar').classList.add('hidden');
+} else {
+  $('btnLeft').classList.add('active');
+  $('btnRight').classList.add('active');
+}
 </script>
 </body>
 </html>
@@ -1226,16 +1343,13 @@ async def serve_ui():
     return _HTML_UI
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------
 
 if __name__ == "__main__":
     _build_graph()
-    print(f"\n  ORION DevTools - Local Test Server")
-    print(f"  -----------------------------------")
-    print(f"  Agent source: {ORION_ROOT}")
-    print(f"  Bridge: SimXArmBridge")
-    print(f"  DEFAULT_MODEL = {os.getenv('DEFAULT_MODEL', '(not set)')}")
-    print(f"  Open \033[4mhttp://localhost:8000\033[0m\n", flush=True)
+    print(f"\n  ORION DevTools")
+    print(f"  ─────────────")
+    print(f"  agent: {ORION_ROOT}")
+    print(f"  model: {os.getenv('DEFAULT_MODEL', '(not set)')}")
+    print(f"  http://localhost:8000\n", flush=True)
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
