@@ -1,75 +1,111 @@
-# ORION DevTools
+# orion-devtools
 
-Local testing tooling for the ORION multi-agent system. Runs the agent graph from `../Orion/` with a pluggable robot bridge (simulated or Gazebo).
+Local dev server for testing the ORION agent graph without Cloud Run, Supabase, or any external infra. Includes a built-in chat UI with trace visualization, a WebSocket bridge endpoint for connecting robots/PLCs, and telemetry recording.
 
-## Quick Start
+## Folder structure
+
+This repo **must** sit next to the main `Orion` folder — it imports the agent graph, workers, and shared state directly from there:
+
+```
+FINAL_PRODUCTS/
+├── Orion/              ← main agent repo (graph, workers, prompts, .env)
+│   ├── src/
+│   │   └── agent/
+│   │       ├── graph.py
+│   │       ├── shared_state.py
+│   │       └── utils/
+│   ├── .env            ← ANTHROPIC_API_KEY, DEFAULT_MODEL, etc.
+│   ├── .venv/          ← shared virtual environment
+│   └── requirements.txt
+│
+└── orion-devtools/     ← this repo
+    ├── test_server.py
+    ├── bridge.py
+    ├── lab_config_dev.json
+    ├── requirements.txt
+    └── README.md
+```
+
+If the folders aren't siblings, the imports will fail. `test_server.py` resolves the path with `../Orion` at startup.
+
+## Setup
+
+### 1. Create a virtual environment (or use Orion's)
+
+You can either create a dedicated venv or reuse the one from `Orion/`. Using Orion's is easier since it already has `langgraph`, `langchain`, etc.
+
+**Option A — reuse Orion's venv:**
 
 ```powershell
-cd C:\Products\FINAL_PRODUCTS\orion-devtools
-
-# Activate the Orion venv (has all agent dependencies)
+cd orion-devtools
 ..\Orion\.venv\Scripts\Activate.ps1
-
-# Install devtools-specific dependencies
 pip install -r requirements.txt
+```
 
-# Run
+**Option B — fresh venv:**
+
+```powershell
+cd orion-devtools
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+pip install -r ..\Orion\requirements.txt   # need the agent deps too
+```
+
+### 2. Check your .env
+
+The server loads `.env` from `../Orion/.env`. Make sure it has at least:
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+DEFAULT_MODEL=claude-sonnet-4-20250514
+```
+
+### 3. Run the server
+
+```powershell
 python test_server.py
 ```
 
-Open [http://localhost:8000](http://localhost:8000)
+Opens at **http://localhost:8000** — the chat UI loads inline, no frontend build step needed.
 
-## Architecture
+## Connecting the bridge
 
-```
-orion-devtools/
-├── test_server.py            # FastAPI server — imports graph from ../Orion
-├── bridge/
-│   ├── robot_interface.py    # Abstract RobotBridge + dataclasses
-│   ├── sim_bridge.py         # SimXArmBridge — in-memory xArm 6 simulation
-│   └── gazebo_bridge.py      # GazeboBridge — connects to Gazebo via rosbridge
-├── requirements.txt
-└── .gitignore
+In a second terminal (same venv activated):
+
+```powershell
+python bridge.py --config lab_config_dev.json
 ```
 
-The server adds `../Orion` to `sys.path` and loads the `.env` from there. No files in the Orion repo are modified.
+The bridge connects to `ws://localhost:8000/ws/robot` and registers whatever devices are defined in your config (xArm, PLC, etc.). The DevTools UI shows connection status in the top bar.
 
-## Robot Bridges
+## What's in the UI
 
-### SimXArmBridge (default)
-In-memory simulation of an xArm 6. Validates workspace limits, joint limits, and requires the real enable sequence (`motion_enable → set_mode(0) → set_state(0)`). No external dependencies.
+- **Chat** — sends messages to the agent graph via SSE streaming (`POST /api/chat`)
+- **Left sidebar** — robot movement log + telemetry recording (record/export as CSV)
+- **Right sidebar** — execution trace (which nodes ran, latency per node) + raw SSE event log
+- **HITL** — if the graph interrupts for human input, a form appears inline
+- **Top bar** — switch interaction mode, model, equipment ID
 
-### GazeboBridge
-Connects to a Gazebo simulation via rosbridge WebSocket (roslibpy). Publishes `JointTrajectory` messages and subscribes to `/joint_states`.
+## API endpoints
 
-**Gazebo in WSL2 setup:**
+| Endpoint | Method | What it does |
+|---|---|---|
+| `/` | GET | Serves the inline HTML UI |
+| `/health` | GET | Status check, lists loaded nodes and connected devices |
+| `/api/chat` | POST | SSE stream — send a message, get back agent response |
+| `/api/confirm` | POST | SSE stream — resume after a HITL interrupt |
+| `/api/robots` | GET | List connected bridge devices |
+| `/api/telemetry/latest` | GET | Last telemetry frame per device |
+| `/api/telemetry/record` | POST | Toggle telemetry recording on/off |
+| `/api/telemetry/export` | GET | Dump recorded telemetry as JSON |
+| `/api/telemetry/clear` | POST | Clear recorded telemetry |
+| `/ws/robot` | WS | Bridge connection endpoint |
 
-1. In WSL2, install ROS 2 + Gazebo + xarm packages
-2. Launch the simulation:
-   ```bash
-   ros2 launch xarm_gazebo xarm6_beside_table_gazebo.launch.py
-   ```
-3. Start rosbridge:
-   ```bash
-   ros2 launch rosbridge_server rosbridge_websocket_launch.xml
-   ```
-4. From Windows, switch bridge in the UI or call:
-   ```
-   POST /api/robot/bridge
-   {"bridge": "gazebo", "host": "localhost", "port": 9090}
-   ```
+## Troubleshooting
 
-### Real Robot (future)
-Not yet implemented. Will connect to xArm SDK directly.
+**"could not build graph"** — usually means `../Orion/src/agent/graph.py` can't be found. Check that the folders are siblings.
 
-## API Endpoints
+**"No module named src.agent..."** — the venv is missing Orion's dependencies. Install them with `pip install -r ../Orion/requirements.txt`.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/` | Web UI |
-| GET | `/health` | Status + loaded nodes + bridge info |
-| POST | `/api/chat` | SSE streaming chat with the agent |
-| POST | `/api/confirm` | Resume HITL (human-in-the-loop) |
-| GET | `/api/robot/state` | Current robot state + action log |
-| POST | `/api/robot/command` | Send manual commands to the robot |
-| POST | `/api/robot/bridge` | Switch between sim/gazebo bridges |
+**Bridge won't connect** — make sure `BRIDGE_TOKEN` matches between the server and bridge. Default is `dev-bridge-token` (set via env var or hardcoded).
