@@ -26,6 +26,7 @@ import json
 import asyncio
 import logging
 import uuid
+import base64
 from datetime import datetime
 from typing import AsyncGenerator, Any, Dict, List, Optional, Union
 
@@ -51,6 +52,7 @@ from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import httpx
+import bcrypt
 
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -63,7 +65,7 @@ from src.agent.utils.stream_utils import (
     unregister_stream_callback,
     get_stream_callback,
 )
-from src.agent.services import init_services, get_supabase
+from src.agent.services import init_services, get_supabase, get_elevenlabs
 
 
 # ── GRAPH SETUP ───────────────────────────────────────────────────────────────
@@ -114,6 +116,8 @@ class ChatRequest(BaseModel):
     robot_ids: Optional[List[str]] = None
     equipment_id: Optional[str] = None
     attachments: Optional[List[Attachment]] = None
+    voice_enabled: bool = False
+    voice_id: Optional[str] = None
 
 
 class ConfirmRequest(BaseModel):
@@ -327,6 +331,56 @@ def sse_event(event_type: str, data: Any) -> str:
     return f"event: {event_type}\ndata: {payload}\n\n"
 
 
+async def stream_tts_chunks(text: str, voice_service, voice_id: str = None) -> AsyncGenerator[str, None]:
+    """Stream ElevenLabs TTS as SSE audio_chunk events. Degrades gracefully on failure."""
+    if not text or not text.strip():
+        yield sse_event("audio_done", {"error": "Empty text", "format": "mp3"})
+        return
+
+    loop = asyncio.get_running_loop()
+    chunk_queue: asyncio.Queue = asyncio.Queue()
+
+    def _run_tts():
+        try:
+            index = 0
+            for audio_bytes in voice_service.stream_tts(text, voice_id=voice_id):
+                item = {
+                    "type": "chunk",
+                    "data": base64.b64encode(audio_bytes).decode("ascii"),
+                    "index": index,
+                    "size": len(audio_bytes),
+                }
+                loop.call_soon_threadsafe(chunk_queue.put_nowait, item)
+                index += 1
+            loop.call_soon_threadsafe(
+                chunk_queue.put_nowait,
+                {"type": "done", "total_chunks": index},
+            )
+        except Exception as e:
+            loop.call_soon_threadsafe(
+                chunk_queue.put_nowait,
+                {"type": "error", "message": f"{type(e).__name__}: {e}"},
+            )
+
+    loop.run_in_executor(None, _run_tts)
+
+    while True:
+        try:
+            item = await asyncio.wait_for(chunk_queue.get(), timeout=30)
+        except asyncio.TimeoutError:
+            yield sse_event("audio_done", {"error": "TTS timeout", "format": "mp3"})
+            break
+
+        if item["type"] == "chunk":
+            yield sse_event("audio_chunk", {"chunk": item["data"], "index": item["index"]})
+        elif item["type"] == "done":
+            yield sse_event("audio_done", {"total_chunks": item["total_chunks"], "format": "mp3"})
+            break
+        elif item["type"] == "error":
+            yield sse_event("audio_done", {"error": item["message"], "format": "mp3"})
+            break
+
+
 from src.agent.graph import ALL_NODES as _ALL_NODES_SET
 _ALL_NODES = sorted(_ALL_NODES_SET)
 
@@ -453,11 +507,7 @@ LAB_DEVICES: Dict[str, set] = {}
 
 
 def _get_lab_token(lab_id: str) -> str:
-    """
-    Resolve the bridge token for a given lab_id.
-    Looks up BRIDGE_TOKEN_<LAB_UPPER>. Falls back to BRIDGE_TOKEN
-    so legacy bridges (no lab_id) keep working.
-    """
+    """DEPRECATED — kept for backward compat. New auth uses _authenticate_bridge."""
     if not lab_id or lab_id == "default":
         return BRIDGE_TOKEN
     env_var = f"BRIDGE_TOKEN_{lab_id.upper().replace('-', '_')}"
@@ -481,7 +531,7 @@ async def _shutdown_http_client():
 def _get_http_client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None:
-        _http_client = httpx.AsyncClient()
+        _http_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
     return _http_client
 
 
@@ -1020,6 +1070,14 @@ async def chat_stream(req: ChatRequest):
             if final_response:
                 yield sse_event("response", {"content": final_response, "session_id": session_id})
 
+            if final_response and req.voice_enabled:
+                voice_svc = get_elevenlabs()
+                if voice_svc:
+                    async for audio_event in stream_tts_chunks(final_response, voice_svc, voice_id=req.voice_id):
+                        yield audio_event
+                else:
+                    yield sse_event("audio_done", {"error": "ElevenLabs not configured", "format": "mp3"})
+
             if chart_payload:
                 yield sse_event("chart", chart_payload)
 
@@ -1229,6 +1287,64 @@ async def approve_joint(req: dict):
     return {"ok": True, "session_id": session_id, "approved": approved}
 
 
+async def _authenticate_bridge(
+    sb_client,
+    token: str,
+    lab_id: str,
+    bridge_id: str,
+    device_id: str,
+) -> tuple[bool, str]:
+    """Validate bridge credentials against Supabase. Returns (ok, reason).
+    Side effect: updates last_seen_at on successful auth."""
+    if not bridge_id:
+        return False, "missing bridge_id"
+    if not token:
+        return False, "missing token"
+
+    try:
+        result = sb_client.schema("bridge").table("credentials") \
+            .select("bridge_id, lab_id, token_hash, allowed_devices, revoked_at, mode") \
+            .eq("bridge_id", bridge_id) \
+            .maybe_single() \
+            .execute()
+    except Exception as e:
+        logger.error(f"bridge auth: DB lookup failed: {e}")
+        return False, "auth backend error"
+
+    cred = result.data if result else None
+    if not cred:
+        return False, f"unknown bridge_id '{bridge_id}'"
+
+    if cred.get("revoked_at"):
+        return False, f"bridge_id '{bridge_id}' has been revoked"
+
+    try:
+        if not bcrypt.checkpw(token.encode(), cred["token_hash"].encode()):
+            return False, "invalid token"
+    except Exception as e:
+        logger.error(f"bridge auth: bcrypt error: {e}")
+        return False, "auth verification failed"
+
+    if cred["lab_id"] != lab_id:
+        return False, f"bridge not authorized for lab '{lab_id}'"
+
+    # mode='shared' bypasses allowed_devices whitelist
+    if cred.get("mode", "strict") != "shared":
+        allowed = cred.get("allowed_devices") or []
+        if device_id not in allowed:
+            return False, f"bridge cannot register device '{device_id}'"
+
+    try:
+        sb_client.schema("bridge").table("credentials") \
+            .update({"last_seen_at": datetime.utcnow().isoformat() + "Z"}) \
+            .eq("bridge_id", bridge_id) \
+            .execute()
+    except Exception:
+        pass
+
+    return True, "ok"
+
+
 @app.websocket("/ws/robot")
 async def ws_robot(ws: WebSocket):
     await ws.accept()
@@ -1241,13 +1357,31 @@ async def ws_robot(ws: WebSocket):
 
     token = init.get("token", "")
     robot_id = init.get("robot_id", "")
-    lab_id = init.get("lab_id", "default")          # ← NUEVO
-    bridge_id = init.get("bridge_id", "")           # ← NUEVO
+    lab_id = init.get("lab_id", "default")
+    bridge_id = init.get("bridge_id", "")
 
-    expected_token = _get_lab_token(lab_id)         # ← CAMBIADO
-    if token != expected_token or not robot_id:
-        await ws.close(code=4003, reason="Invalid token or missing robot_id")
+    if not robot_id:
+        await ws.close(code=4003, reason="missing robot_id")
         return
+
+    sb = get_supabase()
+    if sb is None:
+        logger.error("Supabase not available — cannot validate bridge credentials")
+        await ws.close(code=4500, reason="Auth backend unavailable")
+        return
+
+    ok, reason = await _authenticate_bridge(sb, token, lab_id, bridge_id, robot_id)
+    if not ok:
+        logger.warning(
+            f"Bridge auth REJECTED: bridge_id={bridge_id} lab={lab_id} "
+            f"device={robot_id} reason={reason}"
+        )
+        await ws.close(code=4003, reason=reason[:120])
+        return
+
+    logger.info(
+        f"Bridge auth OK: bridge_id={bridge_id} lab={lab_id} device={robot_id}"
+    )
 
     if robot_id in ROBOT_CONNECTIONS:
         logger.warning(f"[{robot_id}] already registered — evicting stale connection")
@@ -1362,11 +1496,14 @@ async def ws_robot(ws: WebSocket):
 @app.get("/api/robots")
 async def list_robots():
     if BACKEND_MODE == "cloud":
-        r = await _get_http_client().get(
-            f"{CLOUD_AGENT_URL}/api/robots",
-            headers=_cloud_headers(),
-            timeout=10.0,
-        )
+        try:
+            r = await _get_http_client().get(
+                f"{CLOUD_AGENT_URL}/api/robots",
+                headers=_cloud_headers(),
+                timeout=10.0,
+            )
+        except httpx.ReadTimeout:
+            raise HTTPException(status_code=504, detail="Backend timeout — Sentinela may be cold starting. Retry in a few seconds.")
         return JSONResponse(content=r.json(), status_code=r.status_code)
 
     robots = []
@@ -1690,6 +1827,15 @@ async def record_summary(session_id: str):
     }
 
 
+@app.get("/api/deepgram-token")
+async def get_deepgram_token():
+    """Return a Deepgram API key for browser STT."""
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
+        return JSONResponse({"error": "Deepgram not configured"}, status_code=500)
+    return JSONResponse({"key": api_key})
+
+
 # ── HTML UI ───────────────────────────────────────────────────────────────────
 
 _HTML_UI = r"""<!DOCTYPE html>
@@ -1910,6 +2056,24 @@ body {
 .sb-export { padding: 8px 14px; border-top: 1px solid #e0e0e0; display: flex; gap: 4px; flex-shrink: 0; }
 .sb-export button { flex: 1; padding: 5px; border: 1px solid #e5e5e5; border-radius: 5px; background: #fff; font-size: 10px; cursor: pointer; color: #999; }
 .sb-export button:hover { background: #f5f5f5; color: #111; }
+
+/* ── Voice ── */
+.btn-voice { font-size: 14px !important; padding: 3px 8px !important; }
+.btn-voice.active { background: #dc2626 !important; color: #fff !important; border-color: #dc2626 !important; }
+.voice-bar {
+  display: none; align-items: center; gap: 10px; padding: 6px 24px;
+  background: #f0fdf4; border-top: 1px solid #bbf7d0; font-size: 12px; color: #166534;
+  justify-content: center; flex-shrink: 0;
+}
+.voice-bar.on { display: flex; }
+.voice-bar.speaking { background: #eff6ff; border-color: #bfdbfe; color: #1e40af; }
+.voice-indicator { width: 8px; height: 8px; border-radius: 50%; background: #16a34a; flex-shrink: 0; }
+.voice-indicator.pulse { animation: vpulse 0.8s ease-in-out infinite; }
+.voice-indicator.blue { background: #2563eb; }
+@keyframes vpulse { 0%,100%{transform:scale(1);opacity:1} 50%{transform:scale(1.4);opacity:0.7} }
+.voice-transcript { font-style: italic; color: #666; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.voice-stop { padding: 2px 10px; font-size: 11px; border: 1px solid #dc2626; color: #dc2626; background: #fff; border-radius: 4px; cursor: pointer; }
+.voice-stop:hover { background: #fef2f2; }
 </style>
 </head>
 <body>
@@ -1939,6 +2103,7 @@ body {
   </select>
   <input id="cfgEquipment" placeholder="equipment_id" style="width:90px">
   <button id="btnBackend" onclick="toggleBackend()" title="">🟢 Local</button>
+  <button id="btnVoice" class="btn-voice" onclick="toggleVoice()" title="Toggle voice mode">🎙</button>
   <button onclick="clearAll()">clear</button>
   <button id="btnLeft" onclick="toggleLeft()">&#9654; panel</button>
   <button id="btnRight" onclick="toggleSidebar()">trace &#9664;</button>
@@ -2004,6 +2169,12 @@ body {
     <div class="messages" id="msgs"></div>
     <div class="sugs" id="sugs"></div>
     <div class="thinking" id="thinkBar"><div class="dot-pulse"></div><span id="thinkText">thinking...</span></div>
+    <div class="voice-bar" id="voiceBar">
+      <div class="voice-indicator" id="voiceIndicator"></div>
+      <span id="voiceStatus">Listening...</span>
+      <span class="voice-transcript" id="voiceTranscript"></span>
+      <button class="voice-stop" onclick="stopCall()">Stop</button>
+    </div>
     <div class="hitl" id="hitl">
       <h3 id="hitlTitle">Input required</h3>
       <div id="hitlQs"></div>
@@ -2070,6 +2241,186 @@ var msgCount = 0, errCount = 0;
 var runs = [], cur = null;
 var movements = [];
 var backendMode = 'local';
+
+// ── Voice state ──────────────────────────────────────────────────────────────
+var voiceActive = false;
+var voiceIsListening = false;
+var voiceIsSpeaking = false;
+var voiceAudioQueue = [];
+var voiceIsPlaying = false;
+var voiceAudioCtx = null;
+var voiceMediaRecorder = null;
+var voiceMicStream = null;
+var voiceDgSocket = null;
+var voiceDgKey = null;
+var voiceIsCallActiveRef = false;
+
+// ── Voice functions ──────────────────────────────────────────────────────────
+
+function toggleVoice() {
+  if (voiceActive) stopCall(); else startCall();
+}
+
+async function startCall() {
+  if (voiceActive) return;
+  try {
+    var r = await fetch(BASE + '/api/deepgram-token');
+    var d = await r.json();
+    if (d.error) { alert('Voice error: ' + d.error); return; }
+    voiceDgKey = d.key;
+  } catch(e) { alert('Cannot reach /api/deepgram-token: ' + e.message); return; }
+
+  try {
+    voiceMicStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch(e) { alert('Microphone access denied: ' + e.message); return; }
+
+  voiceAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  voiceActive = true;
+  voiceIsCallActiveRef = true;
+  voiceAudioQueue = [];
+  voiceIsPlaying = false;
+  $('btnVoice').classList.add('active');
+  setVoiceBar(true, false, '');
+  connectDeepgram(voiceDgKey, voiceMicStream);
+}
+
+function stopCall() {
+  voiceIsCallActiveRef = false;
+  voiceActive = false;
+  if (voiceMediaRecorder && voiceMediaRecorder.state !== 'inactive') voiceMediaRecorder.stop();
+  if (voiceDgSocket) voiceDgSocket.close();
+  if (voiceMicStream) voiceMicStream.getTracks().forEach(function(t) { t.stop(); });
+  if (voiceAudioCtx) { voiceAudioCtx.close(); voiceAudioCtx = null; }
+  voiceAudioQueue = [];
+  voiceIsPlaying = false;
+  $('btnVoice').classList.remove('active');
+  setVoiceBar(false, false, '');
+}
+
+function setVoiceBar(show, speaking, transcript) {
+  var bar = $('voiceBar');
+  var ind = $('voiceIndicator');
+  var st = $('voiceStatus');
+  var tr = $('voiceTranscript');
+  bar.classList.toggle('on', show);
+  bar.classList.toggle('speaking', speaking);
+  ind.classList.toggle('pulse', show);
+  ind.classList.toggle('blue', speaking);
+  if (show) {
+    st.textContent = speaking ? 'Speaking...' : (busy ? 'Thinking...' : 'Listening...');
+    tr.textContent = transcript || '';
+  }
+}
+
+function connectDeepgram(key, stream) {
+  var url = 'wss://api.deepgram.com/v1/listen?model=nova-2&language=es&smart_format=true&endpointing=300&interim_results=true&utterance_end_ms=1500';
+  var ws;
+  try {
+    ws = new WebSocket(url, ['token', key]);
+  } catch(e) { addChat('err', 'Deepgram WS failed: ' + e.message); stopCall(); return; }
+  voiceDgSocket = ws;
+  var interimText = '';
+
+  ws.onopen = function() {
+    voiceMediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+    voiceMediaRecorder.ondataavailable = function(ev) {
+      if (ev.data.size > 0 && ws.readyState === WebSocket.OPEN) ws.send(ev.data);
+    };
+    voiceMediaRecorder.start(250);
+    voiceIsListening = true;
+    setVoiceBar(true, false, '');
+  };
+
+  ws.onmessage = function(ev) {
+    var msg;
+    try { msg = JSON.parse(ev.data); } catch(e) { return; }
+    if (msg.type === 'Results') {
+      var alt = msg.channel && msg.channel.alternatives && msg.channel.alternatives[0];
+      if (!alt) return;
+      var txt = alt.transcript || '';
+      var isFinal = msg.is_final;
+      if (txt) {
+        interimText = txt;
+        setVoiceBar(true, false, interimText);
+      }
+      if (isFinal && txt) interimText = txt;
+    } else if (msg.type === 'UtteranceEnd') {
+      if (!interimText.trim()) return;
+      var toSend = interimText;
+      interimText = '';
+      if (voiceMediaRecorder && voiceMediaRecorder.state === 'recording') voiceMediaRecorder.pause();
+      setVoiceBar(true, false, toSend);
+      sendVoice(toSend);
+    }
+  };
+
+  ws.onclose = function() {
+    voiceIsListening = false;
+    if (voiceIsCallActiveRef) {
+      setTimeout(function() { if (voiceIsCallActiveRef) connectDeepgram(key, stream); }, 500);
+    }
+  };
+}
+
+function sendVoice(text) {
+  if (!text.trim()) return;
+  addChat('user', text); msgCount++;
+  setThink(true, 'thinking...');
+  startRun(text);
+  var mode = currentMode();
+  var body = {
+    message: text, user_name: 'DevTools', user_id: 'devtools',
+    interaction_mode: mode, llm_model: $('cfgModel').value,
+    voice_enabled: true,
+  };
+  var eq = $('cfgEquipment').value.trim(); if (eq) body.equipment_id = eq;
+  if (sessionId) body.session_id = sessionId;
+  if (mode === 'practice' && currentPractice) body.automation_id = currentPractice.id;
+  if (selectedRobotId) body.robot_ids = [selectedRobotId];
+
+  doStream(BASE + '/api/chat', body).then(function(f) {
+    _removeLiveBubble();
+    endRun(f);
+    setThink(false);
+  }).catch(function(e) {
+    addChat('err', e.message); errCount++;
+    setThink(false);
+  });
+}
+
+function voicePlayNextChunk() {
+  if (!voiceAudioQueue.length) {
+    voiceIsPlaying = false;
+    if (voiceIsCallActiveRef) {
+      if (voiceMediaRecorder && voiceMediaRecorder.state === 'paused') voiceMediaRecorder.resume();
+      setVoiceBar(true, false, '');
+    }
+    return;
+  }
+  voiceIsPlaying = true;
+  setVoiceBar(true, true, '');
+  var batch = voiceAudioQueue.splice(0, Math.min(4, voiceAudioQueue.length));
+  var buffers = batch.map(function(b64) {
+    var bin = atob(b64);
+    var arr = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return arr;
+  });
+  var total = buffers.reduce(function(s, b) { return s + b.length; }, 0);
+  var combined = new Uint8Array(total);
+  var offset = 0;
+  buffers.forEach(function(b) { combined.set(b, offset); offset += b.length; });
+
+  voiceAudioCtx.decodeAudioData(combined.buffer, function(decoded) {
+    var src = voiceAudioCtx.createBufferSource();
+    src.buffer = decoded;
+    src.connect(voiceAudioCtx.destination);
+    src.onended = voicePlayNextChunk;
+    src.start();
+  }, function() {
+    voicePlayNextChunk();
+  });
+}
 
 async function loadBackendMode() {
   try {
@@ -2714,6 +3065,17 @@ function handleSSE(type,data,final){
       else if(cmd==='get_position'||cmd==='get_full_status'){mv.joint='ALL';mv.name=cmd;mv.status='query';mv.final_angles=rd.joints||null;}
       else{mv.joint='-';mv.name=cmd;}
       movements.push(mv);renderMoves();
+      break;
+    case 'audio_chunk':
+      if (voiceIsCallActiveRef) {
+        var chunkData = data.chunk || data.audio || data.data || data.content;
+        if (chunkData) {
+          voiceAudioQueue.push(chunkData);
+          if (!voiceIsPlaying) voicePlayNextChunk();
+        }
+      }
+      break;
+    case 'audio_done':
       break;
     case 'error':
       setThink(false);
